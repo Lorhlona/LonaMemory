@@ -1,4 +1,14 @@
 #!/usr/bin/env node
+/**
+ * κ-Memory MCP Server
+ *
+ * BC代数 w = z₊e₊ + z₋e₋ に基づくPhase-Angle Long-Term Memory。
+ * 自然言語を自動エンコードし、暗黒セクター(z₋)の共起学習と
+ * Schur補完(W₀≈10.1)増幅で文脈的想起を実現する。
+ *
+ * κ物理学定数: κ=5.3603, q=0.530, 3世代PT階層
+ * LoNalogy Theory — Lona, 2026
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -8,21 +18,122 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
+// ============================================================
+// Types
+// ============================================================
+
 type ToolResponse = {
   content: Array<{ type: "text"; text: string }>;
 };
 
-type ForgetOptions = {
-  sigma: number;
-  decay: number;
-  referenced: Iterable<string> | null;
-  minAccess: number;
-  halfLifeSeconds?: number;
+const enum Tier {
+  Peripheral = 1, // n=2: sech θ·(5tanh²θ−1), decay ∝ q¹
+  Working = 2,    // n=1: sech²θ·tanh θ,      decay ∝ q²
+  Core = 3,       // n=0: sech³θ,              decay ∝ q³
+}
+
+type MemoryItem = {
+  id: string;
+  text: string;
+  context: string | null;
+  zPlus: Uint8Array;       // visible sector (deterministic hash)
+  zMinus: Float32Array;    // dark sector (learned co-access)
+  amplitude: number;       // [AMP_MIN, AMP_MAX] Hebbian
+  accessCount: number;
+  tier: Tier;
+  createdAt: number;       // millis
+  updatedAt: number;
+  lastAccessAt: number;
 };
+
+type SnapshotItem = {
+  id: string;
+  text: string;
+  context: string | null;
+  zPlus: number[];
+  zMinus: number[];
+  amplitude: number;
+  accessCount: number;
+  tier: number;
+  createdAt: string;
+  updatedAt: string;
+  lastAccessAt: string;
+};
+
+type SnapshotPayload = {
+  version: string;
+  format: "kappa-v1";
+  savedAt: string;
+  dimension: number;
+  constants: { kappa: number; W0: number; q: number };
+  items: SnapshotItem[];
+  migratedFrom?: string;
+};
+
+// Legacy types for migration
+type LegacySnapshotMemory = {
+  dimension: number;
+  alpha: number;
+  items: Record<string, number[]>;
+  access?: Record<string, number>;
+  amplitude?: Record<string, number>;
+  metadata?: Record<string, { createdAt: string; updatedAt: string; lastAccessAt: string }>;
+};
+
+type LegacySnapshot = {
+  version: string;
+  savedAt: string;
+  memories: LegacySnapshotMemory[];
+};
+
+// ============================================================
+// κ Physics Constants — from (1+κ)³ = 48κ, s=3
+// ============================================================
+
+const KAPPA = 5.3603;
+const P_PLUS = 1 / (1 + KAPPA);                    // 0.1572
+const P_MINUS = KAPPA / (1 + KAPPA);                // 0.8428
+const W0 = ((1 + KAPPA) ** 2) / 4;                  // 10.1134 Schur amplification
+const Q_MIX = 4 * KAPPA / ((1 + KAPPA) ** 2);       // 0.5300 sech²θ_eq
+const DIMENSION = 64;
+
+// PT binding energies: ε_n = −(s−n)², s=3
+const PT_BINDING = { [Tier.Core]: 9, [Tier.Working]: 4, [Tier.Peripheral]: 1 } as const;
+
+// Tier decay rates: q^m / q = q^(m-1) normalized so Peripheral = 1
+const TIER_DECAY = {
+  [Tier.Peripheral]: 1.0,
+  [Tier.Working]: Q_MIX,
+  [Tier.Core]: Q_MIX * Q_MIX,
+} as const;
+
+// ============================================================
+// Amplitude & Tier Constants
+// ============================================================
+
+const AMP_MIN = 16;
+const AMP_MAX = 255;
+const AMP_INCREMENT = 32;
+const AMP_READ_INCREMENT = 16;
+
+const TIER_WORKING_THRESHOLD = 5;
+const TIER_CORE_THRESHOLD = 15;
+
+// ============================================================
+// Dark Sector Constants
+// ============================================================
+
+const DARK_BLEND_RATE = 0.05;
+const DARK_MATURITY_THRESHOLD = DIMENSION * 0.3;
+
+// ============================================================
+// LUT (256-entry cos/sin, reused from original)
+// ============================================================
 
 const LUT_SIZE = 256;
 const TWO_PI = Math.PI * 2;
 const INV_TWO_PI = LUT_SIZE / TWO_PI;
+
 const COS_LUT = Array.from({ length: LUT_SIZE }, (_, i) =>
   Math.cos((i / LUT_SIZE) * TWO_PI)
 );
@@ -30,1308 +141,1204 @@ const SIN_LUT = Array.from({ length: LUT_SIZE }, (_, i) =>
   Math.sin((i / LUT_SIZE) * TWO_PI)
 );
 
-const AMP_MIN = 16;
-const AMP_MAX = 255;
-const AMP_INCREMENT = 32;
-const AMP_DECAY = 0.1;
-
-const SNAPSHOT_VERSION = "0.3.2";
-
-type SnapshotMemory = {
-  dimension: number;
-  alpha: number;
-  items: Record<string, number[]>;
-  access?: Record<string, number>;
-  amplitude?: Record<string, number>;
-  metadata?: Record<string, SnapshotMetadataEntry>;
-};
-
-type SnapshotPayload = {
-  version: string;
-  savedAt: string;
-  memories: SnapshotMemory[];
-};
-
-type SnapshotMetadataEntry = {
-  createdAt: string;
-  updatedAt: string;
-  lastAccessAt: string;
-};
-
-const SESSION_MEMORY_GUIDE = {
-  title: "LoNA長期記憶セッションガイド",
-  version: "2.0",
-  summary:
-    "位相メモリによる長期記憶管理。チャット開始時のロード、階層的検索、振幅管理、選択的忘却を体系化。",
-  quickstart: [
-    "一、初回: session_memory_guide を呼び本ガイドを確認する",
-    "二、既存記憶がある場合: load_memory_snapshot でスナップショットを復元",
-    "三、新規の場合: 目次ベクトルを作成（例: [230,210,100,80]）",
-    "四、各ターン: query → 処理 → write の順で記憶を更新",
-    "五、終了時: save_memory_snapshot で永続化",
-  ],
-  concepts: {
-    alpha: {
-      説明: "記憶空間を分離する周波数パラメータ。異なるalphaは完全に独立した記憶バンク。",
-      推奨値: "0.8 (デフォルト)",
-      使い分け: "通常は0.8を使用。異なるプロジェクトや文脈を完全分離したい場合のみ変更。",
-      例: "alpha=0.8は日常記憶、alpha=0.5は実験用、alpha=0.3は一時的作業メモ",
-    },
-    phaseShift: {
-      説明:
-        "記憶の位相をシフトさせる時間的タグ。同じベクトルでも異なる時点として記録可能。",
-      推奨値: "0 (デフォルト) または明示的な時系列値",
-      使い分け:
-        "バージョン管理や時系列データに使用。0, 0.5, 1.0, 1.5...と段階的に増やす。",
-      例: "2023年版はshift=0、2024年版はshift=0.5、2025年版はshift=1.0",
-    },
-    weight: {
-      説明: "記憶の重要度。高いほど振幅が大きくなり検索で優先される。",
-      推奨値: "1.0 (通常) ～ 2.0 (重要)",
-      使い分け: "重要な記憶は1.5-2.0、通常は1.0、試験的な記憶は0.5",
-      注意: "同じIDへの複数回書き込みで位相ブレンディングが発生",
-    },
-    vector: {
-      説明: "記憶の内容を表す多次元ベクトル。通常は4次元、必要に応じて拡張可能。",
-      生成方法: "カテゴリ基底を足し合わせて正規化。または経験的に調整。",
-      注意事項: "原点ベクトル [0,0,0,0] は検索精度が落ちるため避ける",
-    },
-  },
-  setup: [
-    "一、環境変数 LONA_MEMORY_SNAPSHOT でスナップショット保存先を指定（任意）",
-    "二、既存スナップショットがある場合: load_memory_snapshot で復元",
-    "三、新規の場合: 目次ベクトルを作成",
-    "　　例: write_memory({id: '目次ベクトル カテゴリガイド ルート', vector: [230,210,100,80], weight: 1.5, alpha: 0.8})",
-    "四、memory_stats で初期状態を確認",
-  ],
-  loop: [
-    "零、ターン開始時: 関連する目次ベクトルを query_memory_verbose で照会",
-    "　　目的: 現在の話題に関連するジャンル基底を特定",
-    "　　例: query_memory_verbose({vector: [230,210,100,80], topK: 5, alpha: 0.8})",
-    "　　結果: 関連する記憶のIDとスコアのリストを取得",
-    "",
-    "一、必要に応じてジャンル基底を照会",
-    "　　例: ゲーム関連なら [214,172,109,39]、音楽関連なら [173,203,153,82]",
-    "　　注意: 非零ベクトルを使用（原点検索は精度が低い）",
-    "",
-    "二、処理実行後、結果を write_memory で記録",
-    "　　要約を簡潔なIDにする（漢字・かな中心、音声出力を考慮）",
-    "　　例: write_memory({id: '会話記録二千二十五年十月二十三日 ○○完了', vector: [適切な値], weight: 1.0以上, alpha: 0.8})",
-    "　　重要度に応じてweightを調整（通常1.0、重要1.5-2.0）",
-    "",
-    "三、新しい章・プロジェクトの開始時",
-    "　　目次ベクトルまたはジャンル基底に新項目を追記",
-    "　　phaseShift を使って時系列バージョンを分離することも検討",
-  ],
-  maintenance: [
-    "零、セッション終盤の整理ルーチン（推奨）",
-    "　　1. query_memory_verbose で目次ベクトルを再確認",
-    "　　2. 新章の付記漏れがないか点検、必要なら write_memory で追記",
-    "　　3. memory_stats で件数・バイト数・振幅を確認",
-    "　　4. forget_memory を実行（後述）",
-    "　　5. save_memory_snapshot で永続化",
-    "",
-    "一、選択的忘却の実行（forget_memory）",
-    "　　目的: 未参照の記憶を減衰させ、重要な記憶のみを保持",
-    "　　パラメータ:",
-    "　　　sigma: 位相ノイズの強さ（推奨0.05、強く忘れたい場合は0.1-0.2）",
-    "　　　decay: 削除確率（推奨0.1、積極的に削除する場合は0.5-0.9）",
-    "　　　halfLifeSeconds: 半減期（推奨3600秒=1時間、短期記憶なら300秒）",
-    "　　　referenced: 保護する記憶のIDリスト（目次ベクトルは必ず含める）",
-    "　　　minAccess: 最小アクセス回数（この回数未満は忘却対象）",
-    "　　例: forget_memory({sigma: 0.05, decay: 0.1, halfLifeSeconds: 3600, referenced: ['目次ベクトル カテゴリガイド ルート', '重要な記憶ID']})",
-    "",
-    "二、スナップショット保存の定期実行",
-    "　　タイミング: セッション終了時、重要な作業の完了後",
-    "　　保存前に必ず memory_stats で状態確認",
-    "　　例: save_memory_snapshot({path: '/path/to/snapshot.json'})",
-  ],
-  advanced: {
-    "矛盾更新（neutralize）": {
-      説明: "古い事実を削除せずに無効化し、新しい事実を書き込む非破壊的更新",
-      手順: [
-        "一、neutralize_memory で古い記憶にπ位相シフトを適用",
-        "二、同じベクトルで新しい記憶を write_memory",
-        "三、古い記憶は破壊的干渉により検索不能になる",
-      ],
-      例: "neutralize_memory({id: '事実記憶 旧バージョン', dimension: 4, alpha: 0.8})",
-      効果: "Old residual rate = 0.000 を達成（論文G8で実証済み）",
-    },
-    位相ブレンディング: {
-      説明: "同じIDに異なるベクトルを複数回書き込むことで記憶を合成",
-      用途: "複数の観点を統合、段階的な学習",
-      例: [
-        "write_memory({id: 'ブレンド記憶', vector: [255,0,0,0], weight: 0.3})",
-        "write_memory({id: 'ブレンド記憶', vector: [0,255,0,0], weight: 0.3})",
-        "write_memory({id: 'ブレンド記憶', vector: [0,0,255,0], weight: 0.4})",
-      ],
-      結果: "3方向の位相が干渉し、中間的な記憶として検索可能",
-    },
-    多周波バンク: {
-      説明: "異なるalpha値で並列にメモリバンクを運用",
-      用途: "完全に独立したプロジェクト管理、エイリアシング対策",
-      推奨構成: "alpha=0.8（メイン）、alpha=0.5（実験用）、alpha=0.3（一時作業）",
-      注意: "alphaを跨いだ検索はできないため、明確な分離が必要な場合のみ使用",
-    },
-    時系列バージョニング: {
-      説明: "phaseShift を時間軸として使用",
-      用途: "同じ内容の異なる時点での記録",
-      例: [
-        "2023年版: phaseShift=0",
-        "2024年版: phaseShift=0.5",
-        "2025年版: phaseShift=1.0",
-      ],
-      検索: "対応するphaseShiftで query すると該当時点の記憶が優先される",
-    },
-  },
-  troubleshooting: {
-    "検索結果が出ない": [
-      "原因1: 原点ベクトル [0,0,0,0] を使用している → 非零ベクトルに変更",
-      "原因2: alphaが異なる → 記憶時と検索時のalphaを一致させる",
-      "原因3: 記憶が存在しない → memory_stats で確認、必要なら再書き込み",
-      "原因4: neutralize済み → π位相シフトで無効化されている可能性",
-    ],
-    "記憶が消えた": [
-      "原因1: forget_memory で削除された → decay値が高すぎる、referenced に含めるべきだった",
-      "原因2: 別のalphaに書き込んでいた → alpha値を確認",
-      "原因3: スナップショットをロードし直した → 最新の save を忘れていた可能性",
-    ],
-    "検索精度が低い": [
-      "対策1: 目次→ジャンル→詳細の階層検索を使用",
-      "対策2: weightを適切に設定（重要な記憶は1.5-2.0）",
-      "対策3: 類似した記憶が多い場合は phaseShift で分離",
-      "対策4: topKを増やして候補を広げる",
-    ],
-    "メモリ使用量が多い": [
-      "対策1: forget_memory を定期実行",
-      "対策2: 不要な記憶を delete_memory で削除",
-      "対策3: 次元数を最小限に（4-8次元で十分な場合が多い）",
-    ],
-  },
-  tips: [
-    "IDは漢字・かな中心にすると音声出力時に自然（例: '会話記録二千二十五年十月二十三日'）",
-    "目次ベクトルを基点にジャンル基底へ降り、検索と更新を階層化すると精度向上",
-    "ベクトルは話題カテゴリごとの基底を用意し、複数属性は足し合わせて使用",
-    "半減期で削除予定の項目は事前に要約へ統合し、重要語はweightを上げて振幅を維持",
-    "実験的な記憶は別alpha（0.5など）に書き込むと本番環境を汚染しない",
-    "neutralize は削除より安全（いつでも新規書き込みで復活可能）",
-    "定期的に memory_stats でメモリ使用状況を監視",
-    "振幅は自動管理されるため、アクセス頻度が高い記憶ほど強くなる（Hebbian learning）",
-  ],
-  examples: {
-    基本的な使い方: {
-      step1_load: "load_memory_snapshot({path: '/path/to/snapshot.json'})",
-      step2_query: "query_memory_verbose({vector: [230,210,100,80], topK: 5, alpha: 0.8})",
-      step3_write: "write_memory({id: '会話記録 ○○完了', vector: [200,150,100,50], weight: 1.2, alpha: 0.8})",
-      step4_save: "save_memory_snapshot({path: '/path/to/snapshot.json'})",
-    },
-    矛盾更新: {
-      step1_neutralize: "neutralize_memory({id: '古い事実', dimension: 4, alpha: 0.8})",
-      step2_write: "write_memory({id: '新しい事実', vector: [同じベクトル], weight: 2.0, alpha: 0.8})",
-      step3_verify: "query_memory({vector: [同じベクトル], topK: 3, alpha: 0.8}) // 新しい事実のみ返る",
-    },
-    階層検索: {
-      step1_index: "query_memory({vector: [230,210,100,80], topK: 5, alpha: 0.8}) // 目次ベクトル照会",
-      step2_genre: "query_memory({vector: [214,172,109,39], topK: 5, alpha: 0.8}) // ゲームジャンル照会",
-      step3_detail: "query_memory({vector: [126,231,201,106], topK: 3, alpha: 0.8}) // 具体的な記憶",
-    },
-  },
-  performance: {
-    メモリ効率: "8bit/次元 = 4次元で4バイト、128次元で128バイト（従来比1/4）",
-    検索速度: "LUT使用により高速（ただしon-the-flyエンコードで約2.5×のオーバーヘッド）",
-    精度: "8bit量子化でもコサイン類似度と同等（誤差≤0.0245、マージン>0.025で順位保存）",
-    スケーラビリティ: "4次元～128次元まで実証済み、数百～数千項目で実用的",
-  },
-  references: {
-    理論: "LoNA Theory — Unified Rotational Memory Framework (G1-G8)",
-    論文セクション: "Section 6: PhaseAngleMemory",
-    実装: "mcp-servers/lona-memory (TypeScript, 1171 lines)",
-    ベンチマーク: "G8実験結果: Recall@1=1.0, F1=1.0, メモリ50KiB vs 200KiB",
-  },
-};
-
-function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
-}
+// ============================================================
+// Utility Functions
+// ============================================================
 
 function toCode(theta: number): number {
   const wrapped = ((theta % TWO_PI) + TWO_PI) % TWO_PI;
   return Math.round(wrapped * INV_TWO_PI) & 0xff;
 }
 
-function ensureFiniteArray(name: string, arr: number[]): void {
-  for (let i = 0; i < arr.length; i++) {
-    const value = Number(arr[i]);
-    if (!Number.isFinite(value)) {
-      throw new Error(`${name}[${i}] must be a finite number`);
-    }
-  }
-}
-
-function ensureUint8ishArray(name: string, arr: number[]): void {
-  for (let i = 0; i < arr.length; i++) {
-    const value = Number(arr[i]);
-    if (!Number.isFinite(value) || !Number.isInteger(value)) {
-      throw new Error(`${name}[${i}] must be an integer between 0 and 255`);
-    }
-    if (value < 0 || value > 255) {
-      throw new Error(`${name}[${i}] must be in the range [0, 255]`);
-    }
-  }
-}
-
-let RAND: () => number = Math.random;
-
-export function setRandomGenerator(generator: () => number): void {
-  RAND = generator;
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 function sampleVonMises(sigma: number): number {
-  if (!(sigma > 0)) {
-    return 0;
-  }
-  const variance = sigma * sigma;
-  const kappa = variance <= 1e-6 ? 1e6 : Math.max(1e-6, 1 / variance);
-  if (kappa <= 1e-6) {
-    return (RAND() - 0.5) * TWO_PI;
-  }
-  const a = 1 + Math.sqrt(1 + 4 * kappa * kappa);
-  const b = (a - Math.sqrt(2 * a)) / (2 * kappa);
-  const r = (1 + b * b) / (2 * b);
-  while (true) {
-    const u1 = RAND();
+  if (sigma <= 0) return 0;
+  const kappa = 1 / (sigma * sigma);
+  if (kappa < 1e-6) return (Math.random() - 0.5) * TWO_PI;
+  const tau = 1 + Math.sqrt(1 + 4 * kappa * kappa);
+  const rho = (tau - Math.sqrt(2 * tau)) / (2 * kappa);
+  const r = (1 + rho * rho) / (2 * rho);
+  for (;;) {
+    const u1 = Math.random();
     const z = Math.cos(Math.PI * u1);
     const f = (1 + r * z) / (r + z);
     const c = kappa * (r - f);
-    const u2 = RAND();
-    if (u2 < c * (2 - c) || u2 <= Math.exp(1 - c)) {
-      const theta = Math.acos(Math.max(-1, Math.min(1, f)));
-      return (RAND() > 0.5 ? 1 : -1) * theta;
+    const u2 = Math.random();
+    if (u2 < c * (2 - c) || u2 <= c * Math.exp(1 - c)) {
+      const u3 = Math.random();
+      return Math.sign(u3 - 0.5) * Math.acos(f);
     }
   }
 }
 
-function buildMixSchedule(weight: number): number[] {
-  const parsed = Number.isFinite(weight) ? Number(weight) : 0;
-  if (!(parsed > 0)) {
-    return [];
+// ============================================================
+// FNV-1a Hash
+// ============================================================
+
+function fnv1a(str: string, seed: number = 0x811c9dc5): number {
+  let hash = seed >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
   }
-  const whole = Math.floor(parsed);
-  const frac = parsed - whole;
-  const schedule: number[] = [];
-  for (let i = 0; i < whole; i++) {
-    schedule.push(1);
-  }
-  const tail = whole === 0 ? parsed : frac;
-  const clampedTail = clamp01(tail);
-  if (clampedTail > 0) {
-    schedule.push(clampedTail);
-  }
-  return schedule;
+  return hash >>> 0;
 }
 
-function nowMillis(): number {
-  return Date.now();
+function hashToPhase(hash: number): number {
+  return (hash / 0x100000000) * TWO_PI;
 }
+
+// ============================================================
+// Text → Phase Vector (z₊ visible sector)
+//
+// Multi-scale simhash: 4 bands × 16 dimensions = 64
+// Band 0: char unigrams (individual characters — critical for CJK)
+// Band 1: char bigrams
+// Band 2: char trigrams
+// Band 3: tokens (CJK chars + space-split words) + token bigrams
+// ============================================================
+
+function normalizeText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** CJK range check (CJK Unified + Hiragana + Katakana + CJK symbols) */
+function isCJK(code: number): boolean {
+  return (
+    (code >= 0x4e00 && code <= 0x9fff) ||  // CJK Unified Ideographs
+    (code >= 0x3040 && code <= 0x309f) ||  // Hiragana
+    (code >= 0x30a0 && code <= 0x30ff) ||  // Katakana
+    (code >= 0x3400 && code <= 0x4dbf) ||  // CJK Extension A
+    (code >= 0xff00 && code <= 0xffef) ||  // Fullwidth
+    (code >= 0x3000 && code <= 0x303f)     // CJK Symbols
+  );
+}
+
+/** Tokenize: each CJK char is its own token; latin words are space-split */
+function tokenize(text: string): string[] {
+  const tokens: string[] = [];
+  let buf = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (isCJK(code)) {
+      if (buf.length > 0) { tokens.push(buf); buf = ""; }
+      tokens.push(ch);
+    } else if (ch === " ") {
+      if (buf.length > 0) { tokens.push(buf); buf = ""; }
+    } else {
+      buf += ch;
+    }
+  }
+  if (buf.length > 0) tokens.push(buf);
+  return tokens;
+}
+
+/** BM25 multi-granularity tokenizer: unigrams + bigrams + char-trigrams */
+function bm25Tokenize(text: string): string[] {
+  const norm = normalizeText(text);
+  const baseTokens = tokenize(norm);
+  const result: string[] = [];
+
+  // Level 1: unigrams (CJK chars / latin words)
+  for (const t of baseTokens) result.push(t);
+
+  // Level 2: token bigrams (phrase matching)
+  for (let i = 0; i < baseTokens.length - 1; i++) {
+    result.push(baseTokens[i] + "\x01" + baseTokens[i + 1]);
+  }
+
+  // Level 3: character trigrams (substring/partial matching)
+  const clean = norm.replace(/\s+/g, "");
+  for (let i = 0; i <= clean.length - 3; i++) {
+    result.push("\x02" + clean.substring(i, i + 3));
+  }
+
+  return result;
+}
+
+function textToPhaseVector(text: string): Uint8Array {
+  const norm = normalizeText(text);
+  const codes = new Uint8Array(DIMENSION);
+  const BAND = DIMENSION / 4; // 16
+
+  const accRe = new Float64Array(DIMENSION);
+  const accIm = new Float64Array(DIMENSION);
+
+  // Band 0: character unigrams (each char gets a slot — vital for CJK)
+  for (let i = 0; i < norm.length; i++) {
+    const ch = norm[i];
+    if (ch === " ") continue;
+    const dim = fnv1a(ch, 0x99999999) % BAND;
+    const phase = hashToPhase(fnv1a(ch, 0xaaaaaaaa));
+    accRe[dim] += Math.cos(phase);
+    accIm[dim] += Math.sin(phase);
+  }
+
+  // Band 1: character bigrams
+  for (let i = 0; i < norm.length - 1; i++) {
+    const bg = norm.substring(i, i + 2);
+    if (bg.includes(" ")) continue;
+    const dim = BAND + (fnv1a(bg, 0xbaadf00d) % BAND);
+    const phase = hashToPhase(fnv1a(bg, 0xdeadbeef));
+    accRe[dim] += Math.cos(phase);
+    accIm[dim] += Math.sin(phase);
+  }
+
+  // Band 2: character trigrams
+  for (let i = 0; i < norm.length - 2; i++) {
+    const tg = norm.substring(i, i + 3);
+    if (tg.includes(" ")) continue;
+    const dim = 2 * BAND + (fnv1a(tg, 0xcafebabe) % BAND);
+    const phase = hashToPhase(fnv1a(tg, 0xfeedface));
+    accRe[dim] += Math.cos(phase);
+    accIm[dim] += Math.sin(phase);
+  }
+
+  // Band 3: tokens (CJK-aware) + token bigrams + global
+  const tokens = tokenize(norm);
+  for (const tok of tokens) {
+    const dim = 3 * BAND + (fnv1a(tok, 0x12345678) % BAND);
+    const phase = hashToPhase(fnv1a(tok, 0x87654321));
+    accRe[dim] += Math.cos(phase);
+    accIm[dim] += Math.sin(phase);
+  }
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const tb = tokens[i] + tokens[i + 1];
+    const dim = 3 * BAND + (fnv1a(tb, 0xabcdef01) % BAND);
+    const phase = hashToPhase(fnv1a(tb, 0x10fedcba));
+    accRe[dim] += Math.cos(phase);
+    accIm[dim] += Math.sin(phase);
+  }
+
+  // Convert sin/cos accumulations → 8-bit phase codes
+  for (let i = 0; i < DIMENSION; i++) {
+    if (accRe[i] === 0 && accIm[i] === 0) {
+      codes[i] = fnv1a(norm, 0x11111111 + i) & 0xff;
+    } else {
+      codes[i] = toCode(Math.atan2(accIm[i], accRe[i]));
+    }
+  }
+
+  return codes;
+}
+
+// ============================================================
+// MinHeap (top-K retrieval, reused from original)
+// ============================================================
 
 class MinHeap {
   private items: Array<{ id: string; score: number }> = [];
-
-  constructor(private readonly k: number) {}
+  constructor(private k: number) {}
 
   push(entry: { id: string; score: number }): void {
-    if (this.k <= 0) return;
     if (this.items.length < this.k) {
       this.items.push(entry);
       this.heapifyUp(this.items.length - 1);
-      return;
-    }
-    if (entry.score > this.items[0].score) {
+    } else if (entry.score > this.items[0].score) {
       this.items[0] = entry;
       this.heapifyDown(0);
     }
   }
 
-  private heapifyUp(index: number): void {
-    while (index > 0) {
-      const parent = (index - 1) >> 1;
-      if (this.items[parent].score <= this.items[index].score) break;
-      [this.items[parent], this.items[index]] = [this.items[index], this.items[parent]];
-      index = parent;
+  private heapifyUp(i: number): void {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.items[i].score < this.items[p].score) {
+        [this.items[i], this.items[p]] = [this.items[p], this.items[i]];
+        i = p;
+      } else break;
     }
   }
 
-  private heapifyDown(index: number): void {
-    const length = this.items.length;
-    while (true) {
-      let smallest = index;
-      const left = index * 2 + 1;
-      const right = left + 1;
-      if (left < length && this.items[left].score < this.items[smallest].score) {
-        smallest = left;
-      }
-      if (right < length && this.items[right].score < this.items[smallest].score) {
-        smallest = right;
-      }
-      if (smallest === index) break;
-      [this.items[smallest], this.items[index]] = [this.items[index], this.items[smallest]];
-      index = smallest;
+  private heapifyDown(i: number): void {
+    const n = this.items.length;
+    for (;;) {
+      let smallest = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && this.items[l].score < this.items[smallest].score) smallest = l;
+      if (r < n && this.items[r].score < this.items[smallest].score) smallest = r;
+      if (smallest === i) break;
+      [this.items[i], this.items[smallest]] = [this.items[smallest], this.items[i]];
+      i = smallest;
     }
   }
 
   toSortedDesc(): Array<{ id: string; score: number }> {
-    return [...this.items].sort((a, b) => {
-      if (b.score === a.score) {
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-      }
-      return b.score - a.score;
-    });
+    return this.items
+      .slice()
+      .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   }
 }
 
-class PhaseAngleMemory {
-  private readonly dimension: number;
-  private readonly alpha: number;
-  private readonly items = new Map<string, Uint8Array>();
-  private readonly access = new Map<string, number>();
-  private readonly amplitudes = new Map<string, number>();
-  private readonly metadata = new Map<string, { createdAt: number; updatedAt: number; lastAccessAt: number }>();
+// ============================================================
+// KappaMemory — BC代数メモリシステム
+// ============================================================
 
-  constructor(dimension: number, alpha: number) {
-    this.dimension = dimension;
-    this.alpha = alpha;
+class KappaMemory {
+  private items: Map<string, MemoryItem> = new Map();
+
+  // ------- BM25 Inverted Index (visible sector enhancement) -------
+  private invertedIndex: Map<string, Set<string>> = new Map();
+  private docTokenCache: Map<string, string[]> = new Map();
+  private totalTokenCount: number = 0;
+  private static readonly BM25_K1 = 1.5;
+  private static readonly BM25_B = 0.75;
+
+  // ------- ID generation -------
+
+  private generateId(text: string): string {
+    const preview = text.substring(0, 60).replace(/\s+/g, " ").trim();
+    const hash = fnv1a(text).toString(16).padStart(8, "0");
+    return `${preview}#${hash}`;
   }
 
-  getDimension(): number {
-    return this.dimension;
+  // ------- Tier classification (PT eigenstates) -------
+
+  private classifyTier(accessCount: number): Tier {
+    if (accessCount >= TIER_CORE_THRESHOLD) return Tier.Core;
+    if (accessCount >= TIER_WORKING_THRESHOLD) return Tier.Working;
+    return Tier.Peripheral;
   }
 
-  getAlpha(): number {
-    return this.alpha;
+  // ------- BM25 Index Management -------
+
+  private addToIndex(id: string, tokens: string[]): void {
+    this.docTokenCache.set(id, tokens);
+    this.totalTokenCount += tokens.length;
+    const seen = new Set<string>();
+    for (const t of tokens) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      let set = this.invertedIndex.get(t);
+      if (!set) { set = new Set(); this.invertedIndex.set(t, set); }
+      set.add(id);
+    }
   }
 
-  private encodePhaseCodes(vector: number[], phaseShift = 0): Uint8Array {
-    if (vector.length !== this.dimension) {
-      throw new Error(
-        `vector dimension mismatch: expected ${this.dimension}, received ${vector.length}`
-      );
+  private removeFromIndex(id: string): void {
+    const tokens = this.docTokenCache.get(id);
+    if (!tokens) return;
+    this.totalTokenCount -= tokens.length;
+    const seen = new Set<string>();
+    for (const t of tokens) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      const set = this.invertedIndex.get(t);
+      if (set) { set.delete(id); if (set.size === 0) this.invertedIndex.delete(t); }
     }
-    const shiftCode = phaseShift !== 0 ? toCode(phaseShift) : 0;
-    const codes = new Uint8Array(this.dimension);
-    for (let i = 0; i < vector.length; i++) {
-      const theta = this.alpha * vector[i];
-      const base = toCode(theta);
-      codes[i] = (base + shiftCode) & 0xff;
-    }
-    return codes;
+    this.docTokenCache.delete(id);
   }
 
-  write(id: string, vector: number[], weight = 1, phaseShift = 0): void {
-    const weightValue = Number.isFinite(weight) ? Number(weight) : 0;
-    const schedule = buildMixSchedule(weightValue);
-    if (schedule.length === 0) {
-      return;
-    }
-    const newCodes = this.encodePhaseCodes(vector, phaseShift);
-    const existed = this.items.has(id);
-    this.applyWriteSchedule(id, newCodes, schedule);
-    this.updateAmplitude(id, weightValue, existed);
-    this.access.set(id, 0);
-    this.updateMetadataOnWrite(id, existed);
+  private getAvgDocLen(): number {
+    const n = this.docTokenCache.size;
+    return n > 0 ? this.totalTokenCount / n : 1;
   }
 
-  writeCodes(id: string, codesInput: number[], weight = 1): void {
-    if (codesInput.length !== this.dimension) {
-      throw new Error(
-        `code dimension mismatch: expected ${this.dimension}, received ${codesInput.length}`
-      );
+  private scoreBM25(queryTokens: string[], itemId: string): number {
+    const docToks = this.docTokenCache.get(itemId);
+    if (!docToks || docToks.length === 0) return 0;
+    const tf = new Map<string, number>();
+    for (const t of docToks) tf.set(t, (tf.get(t) || 0) + 1);
+    const N = this.items.size;
+    const avgDl = this.getAvgDocLen();
+    const dl = docToks.length;
+    const k1 = KappaMemory.BM25_K1;
+    const b = KappaMemory.BM25_B;
+    let score = 0;
+    const seen = new Set<string>();
+    for (const qt of queryTokens) {
+      if (seen.has(qt)) continue;
+      seen.add(qt);
+      const df = this.invertedIndex.get(qt)?.size ?? 0;
+      if (df === 0) continue;
+      const termFreq = tf.get(qt) ?? 0;
+      if (termFreq === 0) continue;
+      const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
+      const tfNorm = (termFreq * (k1 + 1)) / (termFreq + k1 * (1 - b + b * dl / avgDl));
+      score += idf * tfNorm;
     }
-    const weightValue = Number.isFinite(weight) ? Number(weight) : 0;
-    const schedule = buildMixSchedule(weightValue);
-    if (schedule.length === 0) {
-      return;
-    }
-    const codes = Uint8Array.from(codesInput, (value) => Number(value) & 0xff);
-    const existed = this.items.has(id);
-    this.applyWriteSchedule(id, codes, schedule);
-    this.updateAmplitude(id, weightValue, existed);
-    this.access.set(id, 0);
-    this.updateMetadataOnWrite(id, existed);
+    return score;
   }
 
-  private applyWriteSchedule(
-    id: string,
-    source: Uint8Array,
-    schedule: number[],
-  ): void {
-    if (schedule.length === 0) {
-      return;
+  private rebuildIndex(): void {
+    this.invertedIndex.clear();
+    this.docTokenCache.clear();
+    this.totalTokenCount = 0;
+    for (const [id, item] of this.items) {
+      this.addToIndex(id, bm25Tokenize(item.text));
     }
-    for (const rawMix of schedule) {
-      if (!this.items.has(id)) {
-        this.items.set(id, new Uint8Array(source));
-        continue;
+  }
+
+  // ------- Similarity functions -------
+
+  /** Phase-code ↔ phase-code cosine similarity via LUT */
+  private simPhase(a: Uint8Array, b: Uint8Array): number {
+    let sum = 0;
+    for (let i = 0; i < DIMENSION; i++) {
+      sum += COS_LUT[a[i]] * COS_LUT[b[i]] + SIN_LUT[a[i]] * SIN_LUT[b[i]];
+    }
+    return sum / DIMENSION;
+  }
+
+  /** Phase-code query ↔ Float32 dark vector similarity */
+  private simDark(query: Uint8Array, dark: Float32Array): number {
+    let dot = 0;
+    let normD = 0;
+    for (let i = 0; i < DIMENSION; i++) {
+      const qVal = COS_LUT[query[i]]; // use cosine component as scalar projection
+      dot += qVal * dark[i];
+      normD += dark[i] * dark[i];
+    }
+    if (normD < 1e-12) return 0;
+    // Normalize: phase query has unit norm per dimension in cos space
+    let normQ = 0;
+    for (let i = 0; i < DIMENSION; i++) {
+      const c = COS_LUT[query[i]];
+      normQ += c * c;
+    }
+    if (normQ < 1e-12) return 0;
+    return dot / (Math.sqrt(normQ) * Math.sqrt(normD));
+  }
+
+  /** Dark sector maturity [0, 1] */
+  private darkMaturity(zMinus: Float32Array): number {
+    let norm = 0;
+    for (let i = 0; i < DIMENSION; i++) norm += zMinus[i] * zMinus[i];
+    return Math.min(1.0, Math.sqrt(norm) / DARK_MATURITY_THRESHOLD);
+  }
+
+  // ------- BC Scoring (Schur complement + BM25) -------
+
+  private computeScore(
+    queryZPlus: Uint8Array,
+    queryTokens: string[],
+    item: MemoryItem
+  ): { total: number; visible: number; dark: number; bm25: number } {
+    const simV = this.simPhase(queryZPlus, item.zPlus);
+    const simD = this.simDark(queryZPlus, item.zMinus);
+
+    // BM25 exact matching (inverted index)
+    const bm25Raw = this.scoreBM25(queryTokens, item.id);
+    const bm25Norm = bm25Raw / (bm25Raw + 1); // → [0, 1)
+
+    // Blend visible sector: BM25 (precise) + phase (fuzzy fallback)
+    const phaseNorm = clamp01((simV + 1) / 2); // [-1,1] → [0,1]
+    const blendedVisible = 0.7 * bm25Norm + 0.3 * phaseNorm;
+
+    const maturity = this.darkMaturity(item.zMinus);
+    const darkW0 = W0 * maturity;
+    const normFactor = P_PLUS + P_MINUS * Math.min(darkW0, W0);
+
+    // BC score: p₊ × blended_visible + p₋ × W₀_eff × sim_dark
+    const score = (P_PLUS * blendedVisible + P_MINUS * darkW0 * simD) / normFactor;
+
+    // Amplitude scaling (Hebbian, adaptive: less impact when BM25 is confident)
+    const rawAmpScale = Math.max(AMP_MIN, item.amplitude) / AMP_MAX;
+    const ampExponent = 0.05 + 0.4 * (1 - bm25Norm); // 0.05 (precise BM25) to 0.45 (no BM25)
+    const ampScale = Math.pow(rawAmpScale, ampExponent);
+
+    return {
+      total: score * ampScale,
+      visible: blendedVisible,
+      dark: simD,
+      bm25: bm25Norm,
+    };
+  }
+
+  // ------- Dark sector update (co-access learning) -------
+  // Only couple top DARK_COUPLE_LIMIT items to reduce noise associations
+
+  private static readonly DARK_COUPLE_LIMIT = 3;
+
+  private updateDarkSector(accessedIds: string[]): void {
+    if (accessedIds.length < 2) return;
+    // accessedIds is score-sorted; only couple the strongest matches
+    const topIds = accessedIds.slice(0, KappaMemory.DARK_COUPLE_LIMIT);
+    const accessed = topIds
+      .map(id => this.items.get(id))
+      .filter((item): item is MemoryItem => item !== undefined);
+
+    for (let i = 0; i < accessed.length; i++) {
+      for (let j = i + 1; j < accessed.length; j++) {
+        const a = accessed[i];
+        const b = accessed[j];
+        for (let d = 0; d < DIMENSION; d++) {
+          a.zMinus[d] += DARK_BLEND_RATE * COS_LUT[b.zPlus[d]];
+          b.zMinus[d] += DARK_BLEND_RATE * COS_LUT[a.zPlus[d]];
+        }
       }
-      const mix = clamp01(rawMix);
-      if (mix <= 0) {
-        continue;
+    }
+  }
+
+  // ------- Fisher metric decay factor -------
+
+  private fisherDecayFactor(item: MemoryItem): number {
+    const tierDecay = TIER_DECAY[item.tier as Tier] ?? 1.0;
+    const binding = PT_BINDING[item.tier as Tier] ?? 1;
+
+    const age = Math.max(0, Date.now() - item.lastAccessAt);
+    const ageHours = age / (1000 * 60 * 60);
+
+    return Math.min(1.0, tierDecay * (1 + ageHours * 0.1) / binding);
+  }
+
+  // ===== PUBLIC API =====
+
+  remember(text: string, context?: string | null): { id: string; tier: Tier } {
+    const id = this.generateId(text);
+    const zPlus = textToPhaseVector(text);
+    const now = Date.now();
+
+    const existing = this.items.get(id);
+    if (existing) {
+      // Remove old index entry before update
+      this.removeFromIndex(id);
+      // Blend z₊ (50/50 with new)
+      for (let i = 0; i < DIMENSION; i++) {
+        const prevRe = COS_LUT[existing.zPlus[i]];
+        const prevIm = SIN_LUT[existing.zPlus[i]];
+        const newRe = COS_LUT[zPlus[i]];
+        const newIm = SIN_LUT[zPlus[i]];
+        existing.zPlus[i] = toCode(Math.atan2(
+          prevIm * 0.5 + newIm * 0.5,
+          prevRe * 0.5 + newRe * 0.5
+        ));
       }
-      if (mix >= 1) {
-        this.items.set(id, new Uint8Array(source));
-        continue;
+      existing.text = text;
+      if (context) existing.context = context;
+      existing.amplitude = Math.min(AMP_MAX, existing.amplitude + AMP_INCREMENT);
+      existing.accessCount++;
+      existing.updatedAt = now;
+      existing.lastAccessAt = now;
+      existing.tier = this.classifyTier(existing.accessCount);
+      // Re-index with updated text
+      this.addToIndex(id, bm25Tokenize(text));
+      return { id, tier: existing.tier };
+    }
+
+    // New item
+    const zMinus = new Float32Array(DIMENSION);
+    // Seed dark sector from context if provided
+    if (context) {
+      const ctxVec = textToPhaseVector(context);
+      for (let d = 0; d < DIMENSION; d++) {
+        zMinus[d] = COS_LUT[ctxVec[d]] * DARK_BLEND_RATE * 10;
       }
-      const prev = this.items.get(id);
-      if (!prev) {
-        this.items.set(id, new Uint8Array(source));
-        continue;
-      }
-      const blended = this.blendCodes(prev, source, mix);
-      this.items.set(id, blended);
     }
-    if (!this.items.has(id)) {
-      this.items.set(id, new Uint8Array(source));
-    }
+
+    const item: MemoryItem = {
+      id,
+      text,
+      context: context ?? null,
+      zPlus,
+      zMinus,
+      amplitude: AMP_MIN + AMP_INCREMENT,
+      accessCount: 0,
+      tier: Tier.Peripheral,
+      createdAt: now,
+      updatedAt: now,
+      lastAccessAt: now,
+    };
+
+    this.items.set(id, item);
+    // Index for BM25
+    this.addToIndex(id, bm25Tokenize(text));
+    return { id, tier: item.tier };
   }
 
-  private blendCodes(prev: Uint8Array, next: Uint8Array, mix: number): Uint8Array {
-    const clamped = clamp01(mix);
-    if (clamped <= 0) {
-      return new Uint8Array(prev);
-    }
-    if (clamped >= 1) {
-      return new Uint8Array(next);
-    }
-    const blended = new Uint8Array(this.dimension);
-    for (let i = 0; i < this.dimension; i++) {
-      const prevCode = prev[i];
-      const nextCode = next[i];
-      const prevRe = COS_LUT[prevCode];
-      const prevIm = SIN_LUT[prevCode];
-      const nextRe = COS_LUT[nextCode];
-      const nextIm = SIN_LUT[nextCode];
-      const mixRe = prevRe * (1 - clamped) + nextRe * clamped;
-      const mixIm = prevIm * (1 - clamped) + nextIm * clamped;
-      blended[i] = toCode(Math.atan2(mixIm, mixRe));
-    }
-    return blended;
-  }
-
-  private updateAmplitude(id: string, weight: number, _existed: boolean): void {
-    const positive = Math.max(0, Number.isFinite(weight) ? weight : 0);
-    const previous = this.amplitudes.get(id);
-    const base = previous !== undefined ? Math.max(previous, AMP_MIN) : AMP_MIN;
-    const rawIncrement = Math.ceil(positive * AMP_INCREMENT);
-    const increment = rawIncrement > 0 ? rawIncrement : (previous === undefined ? AMP_INCREMENT : 1);
-    const next = Math.min(AMP_MAX, base + increment);
-    this.amplitudes.set(id, next);
-  }
-
-  private updateMetadataOnWrite(id: string, _existed: boolean): void {
-    const now = nowMillis();
-    const meta = this.metadata.get(id);
-    if (meta) {
-      meta.updatedAt = now;
-      meta.lastAccessAt = now;
-    } else {
-      this.metadata.set(id, { createdAt: now, updatedAt: now, lastAccessAt: now });
-    }
-  }
-
-  read(vector: number[], topK = 1, phaseShift = 0): string[] {
-    const qCodes = this.encodePhaseCodes(vector, phaseShift);
-    const qPairs = Array.from(qCodes, (code) => [COS_LUT[code], SIN_LUT[code]] as [number, number]);
-    return this.rankFromPairs(qPairs, topK) as string[];
-  }
-
-  readCodes(codesInput: number[], topK = 1): string[] {
-    if (codesInput.length !== this.dimension) {
-      throw new Error(
-        `code dimension mismatch: expected ${this.dimension}, received ${codesInput.length}`
-      );
-    }
-    const qPairs = Array.from(codesInput, (code) => {
-      const idx = Number(code) & 0xff;
-      return [COS_LUT[idx], SIN_LUT[idx]] as [number, number];
-    });
-    return this.rankFromPairs(qPairs, topK) as string[];
-  }
-
-  readVerbose(vector: number[], topK = 1, phaseShift = 0): Array<{ id: string; score: number }> {
-    const qCodes = this.encodePhaseCodes(vector, phaseShift);
-    const qPairs = Array.from(qCodes, (code) => [COS_LUT[code], SIN_LUT[code]] as [number, number]);
-    return this.rankFromPairs(qPairs, topK, true) as Array<{ id: string; score: number }>;
-  }
-
-  private rankFromPairs(
-    qPairs: Array<[number, number]>,
-    topK: number,
-    withScores = false,
-  ): string[] | Array<{ id: string; score: number }> {
+  recall(
+    query: string,
+    topK: number = 5
+  ): Array<{
+    id: string;
+    text: string;
+    context: string | null;
+    score: number;
+    scoreVisible: number;
+    scoreDark: number;
+    scoreBM25: number;
+    tier: Tier;
+  }> {
+    const queryZPlus = textToPhaseVector(query);
+    const queryTokens = bm25Tokenize(query);
     const k = Math.max(1, Math.floor(topK));
     const heap = new MinHeap(k);
 
-    for (const [id, codes] of this.items.entries()) {
-      let score = 0;
-      for (let i = 0; i < this.dimension; i++) {
-        const [qRe, qIm] = qPairs[i];
-        const code = codes[i];
-        score += qRe * COS_LUT[code] + qIm * SIN_LUT[code];
-      }
-      score /= this.dimension;
-      const amplitude = this.amplitudes.get(id) ?? AMP_MIN;
-      const ampScale = Math.max(AMP_MIN, amplitude) / AMP_MAX;
-      heap.push({ id, score: score * ampScale });
+    // Phase 1: BM25 candidate set from inverted index
+    const candidateIds = new Set<string>();
+    for (const qt of queryTokens) {
+      const docs = this.invertedIndex.get(qt);
+      if (docs) for (const id of docs) candidateIds.add(id);
+    }
+
+    // Score BM25 candidates (fast path)
+    for (const id of candidateIds) {
+      const item = this.items.get(id);
+      if (!item) continue;
+      const { total } = this.computeScore(queryZPlus, queryTokens, item);
+      heap.push({ id, score: total });
+    }
+
+    // Phase 2: dark sector fallback — score items with mature z₋
+    // that weren't in the BM25 candidate set
+    for (const [id, item] of this.items) {
+      if (candidateIds.has(id)) continue;
+      if (this.darkMaturity(item.zMinus) < 0.1) continue;
+      const { total } = this.computeScore(queryZPlus, queryTokens, item);
+      heap.push({ id, score: total });
     }
 
     const ordered = heap.toSortedDesc();
-    const now = nowMillis();
+    const results: Array<{
+      id: string;
+      text: string;
+      context: string | null;
+      score: number;
+      scoreVisible: number;
+      scoreDark: number;
+      scoreBM25: number;
+      tier: Tier;
+    }> = [];
+
+    const accessedIds: string[] = [];
+    const now = Date.now();
+
     for (const entry of ordered) {
-      this.access.set(entry.id, (this.access.get(entry.id) ?? 0) + 1);
-      this.touchLastAccess(entry.id, now);
+      const item = this.items.get(entry.id);
+      if (!item) continue;
+
+      // Update access metadata
+      item.accessCount++;
+      item.lastAccessAt = now;
+      item.amplitude = Math.min(AMP_MAX, item.amplitude + AMP_READ_INCREMENT);
+      item.tier = this.classifyTier(item.accessCount);
+
+      const scores = this.computeScore(queryZPlus, queryTokens, item);
+      results.push({
+        id: entry.id,
+        text: item.text,
+        context: item.context,
+        score: round4(scores.total),
+        scoreVisible: round4(scores.visible),
+        scoreDark: round4(scores.dark),
+        scoreBM25: round4(scores.bm25),
+        tier: item.tier,
+      });
+
+      accessedIds.push(entry.id);
     }
-    if (withScores) {
-      return ordered;
-    }
-    return ordered.map((entry) => entry.id);
+
+    // Dark sector update: co-accessed items build associations
+    this.updateDarkSector(accessedIds);
+
+    return results;
   }
 
-  private touchLastAccess(id: string, timestamp: number): void {
-    const meta = this.metadata.get(id);
-    if (meta) {
-      meta.lastAccessAt = timestamp;
-    } else {
-      this.metadata.set(id, { createdAt: timestamp, updatedAt: timestamp, lastAccessAt: timestamp });
-    }
-  }
-
-  private touchUpdatedAt(id: string, timestamp: number): void {
-    const meta = this.metadata.get(id);
-    if (meta) {
-      meta.updatedAt = timestamp;
-    } else {
-      this.metadata.set(id, { createdAt: timestamp, updatedAt: timestamp, lastAccessAt: timestamp });
-    }
-  }
-
-  private degradeAmplitude(id: string, decay: number): void {
-    const current = this.amplitudes.get(id);
-    if (current === undefined) {
-      return;
-    }
-    const clamped = clamp01(decay);
-    const factor = Math.max(0, 1 - AMP_DECAY * (1 + clamped));
-    const next = Math.max(AMP_MIN, Math.round(current * factor));
-    this.amplitudes.set(id, next);
-  }
-
-  forget({ sigma, decay, referenced, minAccess, halfLifeSeconds }: ForgetOptions): number {
-    const refSet = referenced ? new Set(referenced) : new Set<string>();
-    const decayClamped = clamp01(decay);
-    const halfLife = halfLifeSeconds && halfLifeSeconds > 0 ? halfLifeSeconds : 0;
-    const now = nowMillis();
+  forget(): { decayed: number; removed: number } {
+    let decayed = 0;
     let removed = 0;
-    for (const [id, codes] of Array.from(this.items.entries())) {
-      if (refSet.has(id)) {
-        continue;
-      }
-      const accessCount = this.access.get(id) ?? 0;
-      const meta = this.metadata.get(id);
-      let removalChance = 0;
-      if (decayClamped > 0 && accessCount <= minAccess) {
-        removalChance = 1 - (1 - removalChance) * (1 - decayClamped);
-      }
-      if (halfLife > 0 && meta) {
-        const last = meta.lastAccessAt ?? meta.updatedAt ?? meta.createdAt;
-        const ageSeconds = Math.max(0, (now - last) / 1000);
-        if (ageSeconds > 0) {
-          const halfProb = 1 - Math.pow(0.5, ageSeconds / halfLife);
-          removalChance = 1 - (1 - removalChance) * (1 - clamp01(halfProb));
+    const now = Date.now();
+
+    for (const [id, item] of this.items.entries()) {
+      const decay = this.fisherDecayFactor(item);
+
+      // Phase dephasing (Von Mises noise proportional to decay)
+      if (decay > 0.01) {
+        const sigma = decay * 0.1;
+        for (let i = 0; i < DIMENSION; i++) {
+          const noise = sampleVonMises(sigma);
+          const shift = Math.round(noise * INV_TWO_PI);
+          item.zPlus[i] = (item.zPlus[i] + shift) & 0xff;
         }
+        decayed++;
       }
-      if (removalChance > 0 && RAND() < removalChance) {
-        this.items.delete(id);
-        this.access.delete(id);
-        this.amplitudes.delete(id);
-        this.metadata.delete(id);
-        removed += 1;
-        continue;
-      }
-      if (sigma > 0) {
-        const updated = new Uint8Array(codes.length);
-        for (let i = 0; i < codes.length; i++) {
-          const shift = sampleVonMises(sigma);
-          const shiftCodes = shift * INV_TWO_PI;
-          let delta = Math.trunc(shiftCodes);
-          const frac = shiftCodes - delta;
-          const prob = Math.abs(frac);
-          if (prob > 0 && RAND() < prob) {
-            delta += frac > 0 ? 1 : -1;
-          }
-          updated[i] = (codes[i] + delta) & 0xff;
-        }
-        this.items.set(id, updated);
-      }
-      this.degradeAmplitude(id, decayClamped);
-      this.touchUpdatedAt(id, now);
-    }
-    return removed;
-  }
 
-  delete(id: string): boolean {
-    const existed = this.items.delete(id);
-    this.access.delete(id);
-    this.amplitudes.delete(id);
-    this.metadata.delete(id);
-    return existed;
-  }
-
-  list(limit: number): string[] {
-    return Array.from(this.items.keys()).slice(0, limit);
-  }
-
-  stats() {
-    return {
-      dimension: this.dimension,
-      alpha: this.alpha,
-      itemCount: this.items.size,
-      memoryBytes: this.memoryBytes(),
-    };
-  }
-
-  memoryBytes(): number {
-    return this.items.size * (this.dimension + 1);
-  }
-
-  private setRaw(
-    id: string,
-    codes: number[],
-    accessCount: number,
-    amplitude?: number,
-    metadata?: SnapshotMetadataEntry | null,
-  ): void {
-    if (codes.length !== this.dimension) {
-      throw new Error(
-        `code dimension mismatch: expected ${this.dimension}, received ${codes.length}`
+      // Amplitude decay
+      item.amplitude = Math.max(
+        AMP_MIN,
+        Math.round(item.amplitude * (1 - 0.1 * decay))
       );
+
+      // Probabilistic removal for deeply decayed Peripheral items
+      if (
+        item.tier === Tier.Peripheral &&
+        decay > 0.8 &&
+        Math.random() < decay * 0.3
+      ) {
+        this.removeFromIndex(id);
+        this.items.delete(id);
+        removed++;
+        continue;
+      }
+
+      item.updatedAt = now;
     }
-    const array = Uint8Array.from(codes, (value) => Number(value) & 0xff);
-    this.items.set(id, array);
-    this.access.set(id, Math.max(0, Math.floor(accessCount)));
 
-    const amp = Number.isFinite(amplitude ?? NaN)
-      ? Math.max(AMP_MIN, Math.min(AMP_MAX, Math.round(amplitude!)))
-      : AMP_MIN;
-    this.amplitudes.set(id, amp);
+    return { decayed, removed };
+  }
 
-    const fallback = nowMillis();
-    const parseTime = (value?: string): number => {
-      if (!value) return fallback;
-      const parsed = Date.parse(value);
-      return Number.isFinite(parsed) ? parsed : fallback;
+  deleteItem(id: string): boolean {
+    this.removeFromIndex(id);
+    return this.items.delete(id);
+  }
+
+  listItems(limit: number = 100): Array<{ id: string; text: string; tier: Tier; accessCount: number }> {
+    const results: Array<{ id: string; text: string; tier: Tier; accessCount: number }> = [];
+    let count = 0;
+    for (const item of this.items.values()) {
+      if (count >= limit) break;
+      results.push({ id: item.id, text: item.text, tier: item.tier, accessCount: item.accessCount });
+      count++;
+    }
+    return results;
+  }
+
+  stats(): {
+    totalItems: number;
+    tiers: { core: number; working: number; peripheral: number };
+    memoryBytes: number;
+    constants: { kappa: number; W0: number; q: number; dimension: number };
+  } {
+    let core = 0, working = 0, peripheral = 0;
+    let bytes = 0;
+    for (const item of this.items.values()) {
+      if (item.tier === Tier.Core) core++;
+      else if (item.tier === Tier.Working) working++;
+      else peripheral++;
+      // z+ (64 bytes) + z- (64*4 bytes) + overhead (~200)
+      bytes += DIMENSION + DIMENSION * 4 + 200;
+    }
+    return {
+      totalItems: this.items.size,
+      tiers: { core, working, peripheral },
+      memoryBytes: bytes,
+      constants: { kappa: KAPPA, W0: round4(W0), q: round4(Q_MIX), dimension: DIMENSION },
     };
-    if (metadata) {
-      this.metadata.set(id, {
-        createdAt: parseTime(metadata.createdAt),
-        updatedAt: parseTime(metadata.updatedAt),
-        lastAccessAt: parseTime(metadata.lastAccessAt),
-      });
-    } else {
-      this.metadata.set(id, {
-        createdAt: fallback,
-        updatedAt: fallback,
-        lastAccessAt: fallback,
-      });
-    }
   }
 
-  neutralize(id: string): boolean {
-    const codes = this.items.get(id);
-    if (!codes) return false;
-    for (let i = 0; i < codes.length; i++) {
-      codes[i] = (codes[i] + 128) & 0xff;
-    }
-    this.items.set(id, codes);
-    this.touchUpdatedAt(id, nowMillis());
-    return true;
-  }
+  // ------- Snapshot persistence -------
 
-  toSnapshot(): SnapshotMemory {
-    const items: Record<string, number[]> = {};
-    const access: Record<string, number> = {};
-    const amplitude: Record<string, number> = {};
-    const metadata: Record<string, SnapshotMetadataEntry> = {};
-    for (const [id, codes] of this.items.entries()) {
-      items[id] = Array.from(codes);
-      access[id] = this.access.get(id) ?? 0;
-      const amp = this.amplitudes.get(id);
-      if (amp !== undefined) {
-        amplitude[id] = Math.round(Math.max(AMP_MIN, Math.min(AMP_MAX, amp)));
-      }
-      const meta = this.metadata.get(id);
-      if (meta) {
-        metadata[id] = {
-          createdAt: new Date(meta.createdAt).toISOString(),
-          updatedAt: new Date(meta.updatedAt).toISOString(),
-          lastAccessAt: new Date(meta.lastAccessAt).toISOString(),
-        };
-      }
+  toSnapshot(): SnapshotPayload {
+    const items: SnapshotItem[] = [];
+    for (const item of this.items.values()) {
+      items.push({
+        id: item.id,
+        text: item.text,
+        context: item.context,
+        zPlus: Array.from(item.zPlus),
+        zMinus: Array.from(item.zMinus),
+        amplitude: item.amplitude,
+        accessCount: item.accessCount,
+        tier: item.tier as number,
+        createdAt: new Date(item.createdAt).toISOString(),
+        updatedAt: new Date(item.updatedAt).toISOString(),
+        lastAccessAt: new Date(item.lastAccessAt).toISOString(),
+      });
     }
-    const snapshot: SnapshotMemory = {
-      dimension: this.dimension,
-      alpha: this.alpha,
+    return {
+      version: SNAPSHOT_VERSION,
+      format: "kappa-v1",
+      savedAt: new Date().toISOString(),
+      dimension: DIMENSION,
+      constants: { kappa: KAPPA, W0: round4(W0), q: round4(Q_MIX) },
       items,
-      access,
     };
-    if (Object.keys(amplitude).length > 0) {
-      snapshot.amplitude = amplitude;
-    }
-    if (Object.keys(metadata).length > 0) {
-      snapshot.metadata = metadata;
-    }
-    return snapshot;
   }
 
-  static fromSnapshot(entry: SnapshotMemory): PhaseAngleMemory {
-    const memory = new PhaseAngleMemory(entry.dimension, entry.alpha);
-    for (const [id, codes] of Object.entries(entry.items)) {
-      const accessCount = entry.access?.[id] ?? 0;
-      const amp = entry.amplitude?.[id];
-      const meta = entry.metadata?.[id] ?? null;
-      memory.setRaw(id, codes, accessCount, amp, meta);
+  static fromSnapshot(payload: SnapshotPayload): KappaMemory {
+    const mem = new KappaMemory();
+    for (const si of payload.items) {
+      mem.items.set(si.id, KappaMemory.snapshotItemToMemory(si));
     }
-    return memory;
+    mem.rebuildIndex();
+    return mem;
   }
 
+  /** Merge snapshot into existing memory (clear=false support) */
+  mergeFromSnapshot(payload: SnapshotPayload): { added: number; updated: number } {
+    let added = 0;
+    let updated = 0;
+    const now = Date.now();
+
+    for (const si of payload.items) {
+      const existing = this.items.get(si.id);
+      if (existing) {
+        // Merge strategy: newer text wins, max amplitude/access, blend z₋
+        const snapshotUpdated = safeParseDate(si.updatedAt, 0);
+        if (snapshotUpdated > existing.updatedAt) {
+          existing.text = si.text;
+          if (si.context) existing.context = si.context;
+          const zPlus = new Uint8Array(DIMENSION);
+          for (let i = 0; i < DIMENSION && i < si.zPlus.length; i++) zPlus[i] = si.zPlus[i] & 0xff;
+          existing.zPlus = zPlus;
+        }
+        existing.amplitude = Math.min(AMP_MAX, Math.max(existing.amplitude, si.amplitude));
+        existing.accessCount = Math.max(existing.accessCount, si.accessCount);
+        existing.tier = this.classifyTier(existing.accessCount);
+        // Dark sector: weighted average (preserve both learned associations)
+        for (let d = 0; d < DIMENSION && d < si.zMinus.length; d++) {
+          existing.zMinus[d] = existing.zMinus[d] * 0.5 + si.zMinus[d] * 0.5;
+        }
+        existing.updatedAt = now;
+        existing.lastAccessAt = Math.max(existing.lastAccessAt, safeParseDate(si.lastAccessAt, 0));
+        this.removeFromIndex(si.id);
+        this.addToIndex(si.id, bm25Tokenize(existing.text));
+        updated++;
+      } else {
+        // New item
+        this.items.set(si.id, KappaMemory.snapshotItemToMemory(si));
+        this.addToIndex(si.id, bm25Tokenize(si.text));
+        added++;
+      }
+    }
+    return { added, updated };
+  }
+
+  private static snapshotItemToMemory(si: SnapshotItem): MemoryItem {
+    const zPlus = new Uint8Array(DIMENSION);
+    for (let i = 0; i < DIMENSION && i < si.zPlus.length; i++) zPlus[i] = si.zPlus[i] & 0xff;
+    const zMinus = new Float32Array(DIMENSION);
+    for (let i = 0; i < DIMENSION && i < si.zMinus.length; i++) zMinus[i] = si.zMinus[i];
+    const now = Date.now();
+    return {
+      id: si.id,
+      text: si.text,
+      context: si.context,
+      zPlus,
+      zMinus,
+      amplitude: Math.max(AMP_MIN, Math.min(AMP_MAX, si.amplitude)),
+      accessCount: si.accessCount,
+      tier: (si.tier >= 1 && si.tier <= 3 ? si.tier : Tier.Peripheral) as Tier,
+      createdAt: safeParseDate(si.createdAt, now),
+      updatedAt: safeParseDate(si.updatedAt, now),
+      lastAccessAt: safeParseDate(si.lastAccessAt, now),
+    };
+  }
 }
+
+// ============================================================
+// Legacy Migration
+// ============================================================
+
+function migrateFromLegacy(legacy: LegacySnapshot): SnapshotPayload {
+  const items: SnapshotItem[] = [];
+  for (const mem of legacy.memories) {
+    for (const [id, codes] of Object.entries(mem.items)) {
+      // Pad old codes (typically 4-dim) to DIMENSION with deterministic hash
+      const zPlus = new Array(DIMENSION).fill(0);
+      for (let i = 0; i < DIMENSION; i++) {
+        zPlus[i] = i < codes.length ? codes[i] & 0xff : fnv1a(id, 0x11111111 + i) & 0xff;
+      }
+      const acc = mem.access?.[id] ?? 0;
+      items.push({
+        id,
+        text: id, // old IDs were descriptive
+        context: null,
+        zPlus,
+        zMinus: new Array(DIMENSION).fill(0),
+        amplitude: mem.amplitude?.[id] ?? AMP_MIN,
+        accessCount: acc,
+        tier: acc >= TIER_CORE_THRESHOLD ? 3 : acc >= TIER_WORKING_THRESHOLD ? 2 : 1,
+        createdAt: mem.metadata?.[id]?.createdAt ?? new Date().toISOString(),
+        updatedAt: mem.metadata?.[id]?.updatedAt ?? new Date().toISOString(),
+        lastAccessAt: mem.metadata?.[id]?.lastAccessAt ?? new Date().toISOString(),
+      });
+    }
+  }
+  return {
+    version: SNAPSHOT_VERSION,
+    format: "kappa-v1",
+    savedAt: new Date().toISOString(),
+    dimension: DIMENSION,
+    constants: { kappa: KAPPA, W0: round4(W0), q: round4(Q_MIX) },
+    items,
+    migratedFrom: legacy.version,
+  };
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+const SNAPSHOT_VERSION = "1.0.0";
+
+function round4(x: number): number {
+  return Math.round(x * 10000) / 10000;
+}
+
+function safeParseDate(s: string, fallback: number): number {
+  const t = new Date(s).getTime();
+  return Number.isFinite(t) ? t : fallback;
+}
+
+function jsonResponse(data: unknown): ToolResponse {
+  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+}
+
+const TIER_NAMES: Record<number, string> = {
+  1: "Peripheral",
+  2: "Working",
+  3: "Core",
+};
+
+// ============================================================
+// Session Guide
+// ============================================================
+
+const SESSION_GUIDE = {
+  title: "κ-Memory セッションガイド",
+  version: "1.0",
+  theory:
+    "BC代数 w = z₊e₊ + z₋e₋ に基づく位相メモリ。" +
+    "z₊(可視)はテキストの自動ハッシュ、z₋(暗黒)は共起学習。" +
+    "Schur補完 W₀≈10.1 で暗黒セクターが検索を増幅。" +
+    "3世代PT階層: Core(q³) / Working(q²) / Peripheral(q¹)。",
+  quickstart: [
+    "1. load_snapshot で既存スナップショット復元",
+    "2. remember({text: '覚えたい内容'}) で記憶",
+    "3. recall({query: '思い出したいキーワード'}) で想起",
+    "4. forget() で古い記憶を減衰",
+    "5. save_snapshot で永続化",
+  ],
+  tips: [
+    "remember の context パラメータで初期の暗黒セクターをシード可能",
+    "同じ内容を繰り返し recall すると自動的に Core 階層に昇格",
+    "一緒に recall された記憶同士は暗黒セクターで結びつく",
+    "forget は Core 記憶をほぼ消さない（PT束縛エネルギー ε=-9）",
+  ],
+  constants: {
+    "κ": KAPPA,
+    "W₀ (Schur amplification)": round4(W0),
+    "q (sech²θ_eq)": round4(Q_MIX),
+    "p₊ (visible)": round4(P_PLUS),
+    "p₋ (dark)": round4(P_MINUS),
+    "dimension": DIMENSION,
+  },
+};
+
+// ============================================================
+// MCP Server
+// ============================================================
 
 const server = new Server(
-  {
-    name: "mcp-lona-memory",
-    version: "0.3.2",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { name: "kappa-memory", version: SNAPSHOT_VERSION },
+  { capabilities: { tools: {} } }
 );
 
-const memories = new Map<string, PhaseAngleMemory>();
+let memory = new KappaMemory();
 
-function alphaKey(dim: number, alpha: number, precision = 6): string {
-  return `${dim}|${alpha.toFixed(precision)}`;
-}
+// ------- Tool definitions -------
 
-function ensureMemory(dim: number, alpha: number): PhaseAngleMemory {
-  const key = alphaKey(dim, alpha);
-  let memory = memories.get(key);
-  if (!memory) {
-    memory = new PhaseAngleMemory(dim, alpha);
-    memories.set(key, memory);
-  } else if (memory.getDimension() !== dim) {
-    throw new Error(`alpha=${alpha} expects dimension ${memory.getDimension()}, got ${dim}`);
-  }
-  return memory;
-}
-
-function getMemoryForVector(vector: number[], alpha: number): PhaseAngleMemory {
-  return ensureMemory(vector.length, alpha);
-}
-
-function getMemoryForCodes(codes: number[], alpha: number): PhaseAngleMemory {
-  return ensureMemory(codes.length, alpha);
-}
-
-function getMemoriesForAlpha(alpha: number): Array<{ key: string; memory: PhaseAngleMemory }> {
-  const suffix = `|${alpha.toFixed(6)}`;
-  const result: Array<{ key: string; memory: PhaseAngleMemory }> = [];
-  for (const [key, memory] of memories.entries()) {
-    if (key.endsWith(suffix)) result.push({ key, memory });
-  }
-  return result;
-}
-
-function clearMemoriesForAlpha(alpha: number): void {
-  for (const { key } of getMemoriesForAlpha(alpha)) {
-    memories.delete(key);
-  }
-}
-
-function clearAllMemories(): void {
-  memories.clear();
-}
-
-function exportSnapshot(): SnapshotPayload {
-  const payload: SnapshotPayload = {
-    version: SNAPSHOT_VERSION,
-    savedAt: new Date().toISOString(),
-    memories: Array.from(memories.values()).map((memory) => memory.toSnapshot()),
-  };
-  return payload;
-}
-
-async function saveSnapshotToFile(
-  filePath: string
-): Promise<{ memories: number; items: number }> {
-  const snapshot = exportSnapshot();
-  const memoryCount = snapshot.memories.length;
-  const itemCount = snapshot.memories.reduce(
-    (total, entry) => total + Object.keys(entry.items).length,
-    0
-  );
-  const directory = path.dirname(filePath);
-  if (directory && directory !== ".") {
-    await fs.mkdir(directory, { recursive: true });
-  }
-  await fs.writeFile(filePath, JSON.stringify(snapshot, null, 2), "utf8");
-  return { memories: memoryCount, items: itemCount };
-}
-
-async function loadSnapshotFromFile(
-  filePath: string,
-  options: { clearExisting: boolean }
-): Promise<{ memories: number; items: number }> {
-  const raw = await fs.readFile(filePath, "utf8");
-  const parsed = JSON.parse(raw) as SnapshotPayload;
-  if (!parsed || !Array.isArray(parsed.memories)) {
-    throw new Error("invalid snapshot format");
-  }
-  if (options.clearExisting) {
-    clearAllMemories();
-  }
-  let memoryCount = 0;
-  let itemCount = 0;
-  for (const entry of parsed.memories) {
-    const key = alphaKey(entry.dimension, entry.alpha);
-    const memory = PhaseAngleMemory.fromSnapshot(entry);
-    memories.set(key, memory);
-    memoryCount += 1;
-    itemCount += Object.keys(entry.items).length;
-  }
-  return { memories: memoryCount, items: itemCount };
-}
-
-function getArgValue(flag: string): string | null {
-  const index = process.argv.indexOf(flag);
-  if (index >= 0 && index + 1 < process.argv.length) {
-    return process.argv[index + 1];
-  }
-  return null;
-}
-
-async function tryAutoLoadSnapshot(): Promise<void> {
-  const snapshotPath =
-    process.env.LONA_MEMORY_SNAPSHOT ?? getArgValue("--snapshot");
-  if (!snapshotPath) return;
-  try {
-    const result = await loadSnapshotFromFile(snapshotPath, {
-      clearExisting: true,
-    });
-    console.error(
-      `Loaded snapshot: ${result.memories} memories / ${result.items} items from ${snapshotPath}`
-    );
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : JSON.stringify(error);
-    console.error(
-      `Failed to load snapshot from ${snapshotPath}: ${message}`
-    );
-  }
-}
-
-function jsonResponse(obj: unknown): ToolResponse {
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(obj),
-      },
-    ],
-  };
-}
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "write_memory",
-        description: "Store or blend a vector into the LoNA phase memory.",
-        inputSchema: {
-          type: "object",
-          required: ["id", "vector"],
-          properties: {
-            id: { type: "string" },
-            vector: { type: "array", items: { type: "number" } },
-            weight: { type: "number", default: 1 },
-            phaseShift: { type: "number", default: 0 },
-            alpha: { type: "number", default: 0.8 },
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "remember",
+      description:
+        "自然言語で記憶を保存。テキストは自動的にκ物理学の位相ベクトルにエンコードされる。" +
+        "context を渡すと暗黒セクター(z₋)の初期シードになり連想検索が強化される。",
+      inputSchema: {
+        type: "object" as const,
+        required: ["text"],
+        properties: {
+          text: { type: "string", description: "記憶するテキスト" },
+          context: {
+            type: "string",
+            description: "任意: 文脈情報（暗黒セクターのシードに使用）",
           },
         },
       },
-      {
-        name: "write_memory_codes",
-        description: "Store pre-encoded phase codes (8-bit per dimension).",
-        inputSchema: {
-          type: "object",
-          required: ["id", "codes"],
-          properties: {
-            id: { type: "string" },
-            codes: { type: "array", items: { type: "integer" } },
-            weight: { type: "number", default: 1 },
-            alpha: { type: "number", default: 0.8 },
+    },
+    {
+      name: "recall",
+      description:
+        "自然言語で記憶を想起。BCスコアリング: " +
+        "可視セクター(テキスト類似度) + 暗黒セクター(学習済み連想) × Schur補完(W₀≈10.1)。",
+      inputSchema: {
+        type: "object" as const,
+        required: ["query"],
+        properties: {
+          query: { type: "string", description: "検索クエリ（自然言語）" },
+          topK: {
+            type: "integer",
+            default: 5,
+            description: "返す結果数（デフォルト: 5）",
           },
         },
       },
-      {
-        name: "query_memory",
-        description: "Return the top matching identifiers for a query vector.",
-        inputSchema: {
-          type: "object",
-          required: ["vector"],
-          properties: {
-            vector: { type: "array", items: { type: "number" } },
-            topK: { type: "integer", default: 1 },
-            phaseShift: { type: "number", default: 0 },
-            alpha: { type: "number", default: 0.8 },
+    },
+    {
+      name: "forget",
+      description:
+        "Fisher計量 g_θθ = sech²θ による全記憶の減衰。" +
+        "PT束縛エネルギーで階層別: Core(ε=-9,極遅) / Working(ε=-4) / Peripheral(ε=-1,速い)。" +
+        "Peripheral記憶は確率的に削除される。",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "delete_memory",
+      description: "指定IDの記憶を削除する。",
+      inputSchema: {
+        type: "object" as const,
+        required: ["id"],
+        properties: {
+          id: { type: "string", description: "削除する記憶のID" },
+        },
+      },
+    },
+    {
+      name: "list_memory",
+      description: "記憶一覧を返す。",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          limit: { type: "integer", default: 100, description: "最大件数" },
+        },
+      },
+    },
+    {
+      name: "stats",
+      description:
+        "メモリ統計: 総件数、階層分布(Core/Working/Peripheral)、" +
+        "メモリ使用量、κ物理定数。",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "save_snapshot",
+      description: "全記憶をJSONスナップショットとして保存。",
+      inputSchema: {
+        type: "object" as const,
+        required: ["path"],
+        properties: {
+          path: { type: "string", description: "保存先ファイルパス" },
+        },
+      },
+    },
+    {
+      name: "load_snapshot",
+      description:
+        "スナップショットから記憶を復元。旧LonaMemory形式からの自動マイグレーション対応。",
+      inputSchema: {
+        type: "object" as const,
+        required: ["path"],
+        properties: {
+          path: { type: "string", description: "スナップショットのパス" },
+          clear: {
+            type: "boolean",
+            default: true,
+            description: "読み込み前に既存記憶をクリアするか（デフォルト: true）",
           },
         },
       },
-      {
-        name: "query_memory_verbose",
-        description: "Return topK identifiers and similarity scores for a query vector.",
-        inputSchema: {
-          type: "object",
-          required: ["vector"],
-          properties: {
-            vector: { type: "array", items: { type: "number" } },
-            topK: { type: "integer", default: 1 },
-            phaseShift: { type: "number", default: 0 },
-            alpha: { type: "number", default: 0.8 },
-          },
-        },
+    },
+    {
+      name: "session_guide",
+      description: "κ-Memoryの使い方ガイドとκ物理定数を返す。",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
       },
-      {
-        name: "query_memory_codes",
-        description: "Return the top matching identifiers for pre-encoded phase codes.",
-        inputSchema: {
-          type: "object",
-          required: ["codes"],
-          properties: {
-            codes: { type: "array", items: { type: "integer" } },
-            topK: { type: "integer", default: 1 },
-            alpha: { type: "number", default: 0.8 },
-          },
-        },
-      },
-      {
-        name: "forget_memory",
-        description: "Apply mean-zero dephasing/decay to unreferenced memories.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sigma: { type: "number", default: 0.05 },
-            decay: { type: "number", default: 0 },
-            referenced: { type: "array", items: { type: "string" } },
-            minAccess: { type: "integer", default: 0 },
-            halfLifeSeconds: { type: "number", default: 0 },
-            alpha: { type: "number", default: 0.8 },
-          },
-        },
-      },
-      {
-        name: "neutralize_memory",
-        description: "Apply a π phase shift to an existing identifier (non-destructive neutralisation).",
-        inputSchema: {
-          type: "object",
-          required: ["id", "dimension"],
-          properties: {
-            id: { type: "string" },
-            dimension: { type: "integer" },
-            alpha: { type: "number", default: 0.8 },
-          },
-        },
-      },
-      {
-        name: "memory_stats",
-        description: "Return statistics about the memory for a given alpha.",
-        inputSchema: {
-          type: "object",
-          properties: { alpha: { type: "number", default: 0.8 } },
-        },
-      },
-      {
-        name: "clear_memory",
-        description: "Remove all entries for a given alpha.",
-        inputSchema: {
-          type: "object",
-          properties: { alpha: { type: "number", default: 0.8 } },
-        },
-      },
-      {
-        name: "save_memory_snapshot",
-        description: "Persist all memories to a JSON snapshot file.",
-        inputSchema: {
-          type: "object",
-          required: ["path"],
-          properties: {
-            path: { type: "string" },
-          },
-        },
-      },
-      {
-        name: "load_memory_snapshot",
-        description: "Load memories from a JSON snapshot file.",
-        inputSchema: {
-          type: "object",
-          required: ["path"],
-          properties: {
-            path: { type: "string" },
-            clear: { type: "boolean", default: true },
-          },
-        },
-      },
-      {
-        name: "delete_memory",
-        description: "Delete a single identifier from the memory.",
-        inputSchema: {
-          type: "object",
-          required: ["id"],
-          properties: {
-            id: { type: "string" },
-            alpha: { type: "number", default: 0.8 },
-          },
-        },
-      },
-      {
-        name: "list_memory",
-        description: "List stored identifiers (limited).",
-        inputSchema: {
-          type: "object",
-          properties: {
-            limit: { type: "integer", default: 100 },
-            alpha: { type: "number", default: 0.8 },
-            dimension: { type: "integer" },
-          },
-        },
-      },
-      {
-        name: "session_memory_guide",
-        description: "LoNA長期記憶セッション運用の推奨手順を返す。",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-    ],
-  };
-});
+    },
+  ],
+}));
+
+// ------- Tool handler -------
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
   switch (name) {
-    case "write_memory": {
-      const id = String(args?.id ?? "");
-      const vector = (args?.vector as number[]) ?? [];
-      if (!id) throw new Error("id is required");
-      if (!Array.isArray(vector) || vector.length === 0)
-        throw new Error("vector must be a non-empty array of numbers");
-      ensureFiniteArray("vector", vector);
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const instance = getMemoryForVector(vector.map(Number), alpha);
-      const weight = typeof args?.weight === "number" ? args.weight : 1;
-      const phaseShift = typeof args?.phaseShift === "number" ? args.phaseShift : 0;
-      instance.write(id, vector.map(Number), weight, phaseShift);
-      return jsonResponse({ stored: id, alpha });
-    }
-    case "write_memory_codes": {
-      const id = String(args?.id ?? "");
-      const codes = (args?.codes as number[]) ?? [];
-      if (!id) throw new Error("id is required");
-      if (!Array.isArray(codes) || codes.length === 0)
-        throw new Error("codes must be a non-empty array of integers");
-      ensureUint8ishArray("codes", codes);
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const instance = getMemoryForCodes(codes, alpha);
-      const weight = typeof args?.weight === "number" ? args.weight : 1;
-      instance.writeCodes(id, codes, weight);
-      return jsonResponse({ stored: id, alpha });
-    }
-    case "query_memory": {
-      const vector = (args?.vector as number[]) ?? [];
-      if (!Array.isArray(vector) || vector.length === 0)
-        throw new Error("vector must be a non-empty array of numbers");
-      ensureFiniteArray("vector", vector);
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const instance = getMemoryForVector(vector.map(Number), alpha);
-      const topK = typeof args?.topK === "number" ? Math.max(1, Math.floor(args.topK)) : 1;
-      const phaseShift = typeof args?.phaseShift === "number" ? args.phaseShift : 0;
-      const matches = instance.read(vector.map(Number), topK, phaseShift);
-      return jsonResponse({ matches });
-    }
-    case "query_memory_verbose": {
-      const vector = (args?.vector as number[]) ?? [];
-      if (!Array.isArray(vector) || vector.length === 0)
-        throw new Error("vector must be a non-empty array of numbers");
-      ensureFiniteArray("vector", vector);
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const instance = getMemoryForVector(vector.map(Number), alpha);
-      const topK = typeof args?.topK === "number" ? Math.max(1, Math.floor(args.topK)) : 1;
-      const phaseShift = typeof args?.phaseShift === "number" ? args.phaseShift : 0;
-      const verbose = instance.readVerbose(vector.map(Number), topK, phaseShift);
-      const dim = instance.getDimension();
+    case "remember": {
+      const text = String(args?.text ?? "");
+      if (!text) throw new Error("text is required");
+      const context = args?.context != null ? String(args.context) : undefined;
+      const result = memory.remember(text, context);
       return jsonResponse({
-        matches: verbose.map((entry) => entry.id),
-        scores: verbose.map((entry) => entry.score),
-        scoresSum: verbose.map((entry) => entry.score * dim),
-        dimension: dim,
-        alpha,
+        stored: result.id,
+        tier: result.tier,
+        tierName: TIER_NAMES[result.tier],
       });
     }
-    case "query_memory_codes": {
-      const codes = (args?.codes as number[]) ?? [];
-      if (!Array.isArray(codes) || codes.length === 0)
-        throw new Error("codes must be a non-empty array of integers");
-      ensureUint8ishArray("codes", codes);
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const instance = getMemoryForCodes(codes, alpha);
-      const topK = typeof args?.topK === "number" ? Math.max(1, Math.floor(args.topK)) : 1;
-      const matches = instance.readCodes(codes, topK);
-      return jsonResponse({ matches });
-    }
-    case "forget_memory": {
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const memoriesForAlpha = getMemoriesForAlpha(alpha);
-      if (memoriesForAlpha.length === 0) return jsonResponse({ removed: 0, alpha });
-      const sigma = typeof args?.sigma === "number" ? args.sigma : 0.05;
-      const decay = typeof args?.decay === "number" ? args.decay : 0;
-      const referenced = Array.isArray(args?.referenced)
-        ? (args.referenced as string[])
-        : null;
-      const minAccess = typeof args?.minAccess === "number" ? Math.max(0, Math.floor(args.minAccess)) : 0;
-      const halfLifeSeconds =
-        typeof args?.halfLifeSeconds === "number" ? Math.max(0, Number(args.halfLifeSeconds)) : undefined;
-      let removed = 0;
-      for (const { memory } of memoriesForAlpha) {
-        removed += memory.forget({ sigma, decay, referenced, minAccess, halfLifeSeconds });
-      }
-      return jsonResponse({ removed, alpha });
-    }
-    case "neutralize_memory": {
-      const id = String(args?.id ?? "");
-      const dimension =
-        typeof args?.dimension === "number" ? Math.floor(args.dimension) : NaN;
-      if (!id) throw new Error("id is required");
-      if (!Number.isFinite(dimension) || dimension <= 0)
-        throw new Error("dimension is required");
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const key = alphaKey(dimension, alpha);
-      const instance = memories.get(key);
-      if (!instance)
-        return jsonResponse({
-          neutralized: false,
-          reason: "no memory",
-          alpha,
-          id,
-          dimension,
-        });
-      const ok = instance.neutralize(id);
-      return jsonResponse({ neutralized: ok, alpha, id, dimension });
-    }
-    case "memory_stats": {
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const memoriesForAlpha = getMemoriesForAlpha(alpha);
-      if (memoriesForAlpha.length === 0) return jsonResponse({});
-      return jsonResponse(
-        memoriesForAlpha.map(({ memory }) => ({
-          ...memory.stats(),
-        }))
-      );
-    }
-    case "clear_memory": {
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const existing = getMemoriesForAlpha(alpha);
-      clearMemoriesForAlpha(alpha);
-      return jsonResponse({ cleared: existing.length > 0, removed: existing.length, alpha });
-    }
-    case "save_memory_snapshot": {
-      const filePath = String(args?.path ?? "");
-      if (!filePath) throw new Error("path is required");
-      const result = await saveSnapshotToFile(filePath);
+
+    case "recall": {
+      const query = String(args?.query ?? "");
+      if (!query) throw new Error("query is required");
+      const topK = typeof args?.topK === "number" ? args.topK : 5;
+      const results = memory.recall(query, topK);
       return jsonResponse({
-        saved: true,
-        file: filePath,
-        memories: result.memories,
-        items: result.items,
-        version: SNAPSHOT_VERSION,
+        results: results.map(r => ({
+          id: r.id,
+          text: r.text,
+          context: r.context,
+          score: r.score,
+          scoreVisible: r.scoreVisible,
+          scoreDark: r.scoreDark,
+          scoreBM25: r.scoreBM25,
+          tier: r.tier,
+          tierName: TIER_NAMES[r.tier],
+        })),
+        query,
+        topK,
       });
     }
-    case "load_memory_snapshot": {
-      const filePath = String(args?.path ?? "");
-      if (!filePath) throw new Error("path is required");
-      const clear =
-        typeof args?.clear === "boolean" ? Boolean(args.clear) : true;
-      const result = await loadSnapshotFromFile(filePath, {
-        clearExisting: clear,
-      });
-      return jsonResponse({
-        loaded: true,
-        file: filePath,
-        memories: result.memories,
-        items: result.items,
-        version: SNAPSHOT_VERSION,
-        cleared: clear,
-      });
+
+    case "forget": {
+      const result = memory.forget();
+      return jsonResponse(result);
     }
+
     case "delete_memory": {
       const id = String(args?.id ?? "");
       if (!id) throw new Error("id is required");
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const memoriesForAlpha = getMemoriesForAlpha(alpha);
-      if (memoriesForAlpha.length === 0) return jsonResponse({ deleted: false, alpha, id });
-      let deleted = false;
-      for (const { memory } of memoriesForAlpha) {
-        deleted = memory.delete(id) || deleted;
-      }
-      return jsonResponse({ deleted, alpha, id });
+      const deleted = memory.deleteItem(id);
+      return jsonResponse({ deleted, id });
     }
+
     case "list_memory": {
-      const alpha = typeof args?.alpha === "number" ? args.alpha : 0.8;
-      const memoriesForAlpha = getMemoriesForAlpha(alpha);
-      if (memoriesForAlpha.length === 0) return jsonResponse({ alpha, dimension: null, ids: [] });
-      const limit = typeof args?.limit === "number" ? Math.max(1, Math.floor(args.limit)) : 100;
-      const dimFilterRaw = args?.dimension;
-      let dimFilter: number | null = null;
-      if (dimFilterRaw !== undefined) {
-        const parsed = Math.floor(Number(dimFilterRaw));
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-          throw new Error("dimension must be a positive integer");
-        }
-        dimFilter = parsed;
-      }
-      const listed = new Set<string>();
-      for (const { memory } of memoriesForAlpha) {
-        if (dimFilter !== null && memory.getDimension() !== dimFilter) continue;
-        for (const id of memory.list(limit)) {
-          listed.add(id);
-          if (listed.size >= limit) break;
-        }
-        if (listed.size >= limit) break;
-      }
-      return jsonResponse({ alpha, dimension: dimFilter, ids: Array.from(listed) });
+      const limit = typeof args?.limit === "number" ? args.limit : 100;
+      const items = memory.listItems(limit);
+      return jsonResponse({
+        count: items.length,
+        items: items.map(i => ({
+          id: i.id,
+          text: i.text.substring(0, 80),
+          tier: i.tier,
+          tierName: TIER_NAMES[i.tier],
+          accessCount: i.accessCount,
+        })),
+      });
     }
-    case "session_memory_guide": {
-      return jsonResponse(SESSION_MEMORY_GUIDE);
+
+    case "stats": {
+      return jsonResponse(memory.stats());
     }
+
+    case "save_snapshot": {
+      const filePath = String(args?.path ?? "");
+      if (!filePath) throw new Error("path is required");
+      const snapshot = memory.toSnapshot();
+      const dir = path.dirname(filePath);
+      if (dir && dir !== ".") {
+        await fs.mkdir(dir, { recursive: true });
+      }
+      await fs.writeFile(filePath, JSON.stringify(snapshot, null, 2), "utf8");
+      return jsonResponse({
+        saved: true,
+        file: filePath,
+        items: snapshot.items.length,
+        version: SNAPSHOT_VERSION,
+        format: "kappa-v1",
+      });
+    }
+
+    case "load_snapshot": {
+      const filePath = String(args?.path ?? "");
+      if (!filePath) throw new Error("path is required");
+      const clear = typeof args?.clear === "boolean" ? args.clear : true;
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+
+      let snapshot: SnapshotPayload;
+      if (parsed.format === "kappa-v1") {
+        snapshot = parsed as SnapshotPayload;
+      } else if (Array.isArray(parsed.memories)) {
+        // Legacy LonaMemory format → auto-migrate
+        snapshot = migrateFromLegacy(parsed as LegacySnapshot);
+      } else {
+        throw new Error("Unrecognized snapshot format");
+      }
+
+      if (clear) {
+        memory = KappaMemory.fromSnapshot(snapshot);
+        return jsonResponse({
+          loaded: true,
+          mode: "replace",
+          file: filePath,
+          items: snapshot.items.length,
+          format: "kappa-v1",
+          migrated: !!snapshot.migratedFrom,
+          version: snapshot.version,
+        });
+      } else {
+        const result = memory.mergeFromSnapshot(snapshot);
+        return jsonResponse({
+          loaded: true,
+          mode: "merge",
+          file: filePath,
+          added: result.added,
+          updated: result.updated,
+          total: memory.stats().totalItems,
+          format: "kappa-v1",
+          migrated: !!snapshot.migratedFrom,
+          version: snapshot.version,
+        });
+      }
+    }
+
+    case "session_guide": {
+      return jsonResponse(SESSION_GUIDE);
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 });
 
-async function main() {
-  await tryAutoLoadSnapshot();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("LoNA Memory MCP server running on stdio");
+// ============================================================
+// Startup & Auto-load
+// ============================================================
+
+async function tryAutoLoad(): Promise<void> {
+  const snapshotPath =
+    process.env.KAPPA_MEMORY_SNAPSHOT ??
+    process.env.LONA_MEMORY_SNAPSHOT ??
+    process.argv.find((_, i, a) => a[i - 1] === "--snapshot");
+
+  if (!snapshotPath) return;
+
+  try {
+    const raw = await fs.readFile(snapshotPath, "utf8");
+    const parsed = JSON.parse(raw);
+    let snapshot: SnapshotPayload;
+    if (parsed.format === "kappa-v1") {
+      snapshot = parsed as SnapshotPayload;
+    } else if (Array.isArray(parsed.memories)) {
+      snapshot = migrateFromLegacy(parsed as LegacySnapshot);
+      process.stderr.write(`[κ-Memory] Migrated legacy snapshot from v${parsed.version}\n`);
+    } else {
+      process.stderr.write(`[κ-Memory] Warning: unrecognized snapshot format at ${snapshotPath}\n`);
+      return;
+    }
+    memory = KappaMemory.fromSnapshot(snapshot);
+    process.stderr.write(
+      `[κ-Memory] Loaded ${snapshot.items.length} items from ${snapshotPath}\n`
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[κ-Memory] Auto-load failed: ${msg}\n`);
+  }
 }
 
-main().catch(console.error);
+async function main(): Promise<void> {
+  await tryAutoLoad();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(
+    `[κ-Memory] Server started. κ=${KAPPA}, W₀=${round4(W0)}, q=${round4(Q_MIX)}, dim=${DIMENSION}\n`
+  );
+}
+
+main().catch((err) => {
+  process.stderr.write(`[κ-Memory] Fatal: ${err}\n`);
+  process.exit(1);
+});
